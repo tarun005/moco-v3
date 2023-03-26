@@ -15,6 +15,7 @@ import shutil
 import time
 import warnings
 from functools import partial
+import datetime
 
 import torch
 import torch.nn as nn
@@ -28,7 +29,7 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as torchvision_models
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 
 import moco.builder
 import moco.loader
@@ -44,7 +45,7 @@ torchvision_model_names = sorted(name for name in torchvision_models.__dict__
 model_names = ['vit_small', 'vit_base', 'vit_conv_small', 'vit_conv_base'] + torchvision_model_names
 
 parser = argparse.ArgumentParser(description='MoCo ImageNet Pre-Training')
-parser.add_argument('data', metavar='DIR',
+parser.add_argument('-data', metavar='DIR',
                     help='path to dataset')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                     choices=model_names,
@@ -59,9 +60,9 @@ parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch-size', default=4096, type=int,
                     metavar='N',
-                    help='mini-batch size (default: 4096), this is the total '
-                         'batch size of all GPUs on all nodes when '
-                         'using Data Parallel or Distributed Data Parallel')
+                    help='mini-batch size (default: 4096), this is the per '
+                         'batch size of single GPUs on each node.'
+                         'Implementation slighlty different from MoCo-v3')
 parser.add_argument('--lr', '--learning-rate', default=0.6, type=float,
                     metavar='LR', help='initial (base) learning rate', dest='lr')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
@@ -69,7 +70,7 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
 parser.add_argument('--wd', '--weight-decay', default=1e-6, type=float,
                     metavar='W', help='weight decay (default: 1e-6)',
                     dest='weight_decay')
-parser.add_argument('-p', '--print-freq', default=10, type=int,
+parser.add_argument('-p', '--print-freq', default=1, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
@@ -77,7 +78,7 @@ parser.add_argument('--world-size', default=-1, type=int,
                     help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int,
                     help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+parser.add_argument('--dist-url', default='env://',
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
@@ -112,10 +113,13 @@ parser.add_argument('--stop-grad-conv1', action='store_true',
 parser.add_argument('--optimizer', default='lars', type=str,
                     choices=['lars', 'adamw'],
                     help='optimizer used (default: lars)')
+parser.add_argument('--accum_iter', default=1, type=int, 
+                    help="accumulate iterations")
 parser.add_argument('--warmup-epochs', default=10, type=int, metavar='N',
                     help='number of warmup epochs')
 parser.add_argument('--crop-min', default=0.08, type=float,
                     help='minimum scale for random cropping (default: 0.08)')
+parser.add_argument('--output_dir', type=str, default="now")
 
 
 def main():
@@ -158,7 +162,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # suppress printing if not first GPU on each node
     if args.multiprocessing_distributed and (args.gpu != 0 or args.rank != 0):
-        def print_pass(*args):
+        def print_pass(*args, **kwargs):
             pass
         builtins.print = print_pass
 
@@ -187,7 +191,9 @@ def main_worker(gpu, ngpus_per_node, args):
             args.moco_dim, args.moco_mlp_dim, args.moco_t)
 
     # infer learning rate before changing batch size
-    args.lr = args.lr * args.batch_size / 256
+    # args.lr = args.lr * args.batch_size / 256
+    eff_batch_size = args.batch_size * args.accum_iter * args.world_size
+    args.lr = args.lr * eff_batch_size / 256
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
@@ -203,7 +209,7 @@ def main_worker(gpu, ngpus_per_node, args):
             # When using a single GPU per process and per
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
-            args.batch_size = int(args.batch_size / args.world_size)
+            # args.batch_size = int(args.batch_size / args.world_size)
             args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         else:
@@ -219,7 +225,7 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         # AllGather/rank implementation in this code only supports DistributedDataParallel.
         raise NotImplementedError("Only DistributedDataParallel is supported.")
-    print(model) # print model after SyncBatchNorm
+    # print(model) # print model after SyncBatchNorm
 
     if args.optimizer == 'lars':
         optimizer = moco.optimizer.LARS(model.parameters(), args.lr,
@@ -230,7 +236,8 @@ def main_worker(gpu, ngpus_per_node, args):
                                 weight_decay=args.weight_decay)
         
     scaler = torch.cuda.amp.GradScaler()
-    summary_writer = SummaryWriter() if args.rank == 0 else None
+    # summary_writer = SummaryWriter() if args.rank == 0 else None
+    summary_writer = None
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -298,6 +305,11 @@ def main_worker(gpu, ngpus_per_node, args):
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
+    if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                and args.rank == 0): # only the first GPU saves checkpoint
+        if not os.path.exists(args.output_dir):
+            os.makedirs(args.output_dir, exist_ok=True)
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
@@ -307,16 +319,17 @@ def main_worker(gpu, ngpus_per_node, args):
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank == 0): # only the first GPU saves checkpoint
-            save_checkpoint({
+            if (epoch % 20) == 0:
+                save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
                 'optimizer' : optimizer.state_dict(),
                 'scaler': scaler.state_dict(),
-            }, is_best=False, filename='checkpoint_%04d.pth.tar' % epoch)
+            }, is_best=False, filename=os.path.join(args.output_dir, 'checkpoint_%04d.pth.tar' % epoch))
 
-    if args.rank == 0:
-        summary_writer.close()
+    # if args.rank == 0:
+    #     summary_writer.close()
 
 def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
@@ -327,6 +340,8 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
         len(train_loader),
         [batch_time, data_time, learning_rates, losses],
         prefix="Epoch: [{}]".format(epoch))
+
+    accum_iter = args.accum_iter
 
     # switch to train mode
     model.train()
@@ -339,8 +354,11 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
         data_time.update(time.time() - end)
 
         # adjust learning rate and momentum coefficient per iteration
-        lr = adjust_learning_rate(optimizer, epoch + i / iters_per_epoch, args)
+        if i % accum_iter == 0:
+            lr = adjust_learning_rate(optimizer, epoch + i / iters_per_epoch, args)
+
         learning_rates.update(lr)
+
         if args.moco_m_cos:
             moco_m = adjust_moco_momentum(epoch + i / iters_per_epoch, args)
 
@@ -352,15 +370,21 @@ def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
         with torch.cuda.amp.autocast(True):
             loss = model(images[0], images[1], moco_m)
 
+        loss /= accum_iter
+
         losses.update(loss.item(), images[0].size(0))
-        if args.rank == 0:
-            summary_writer.add_scalar("loss", loss.item(), epoch * iters_per_epoch + i)
+        # if args.rank == 0:
+        #     summary_writer.add_scalar("loss", loss.item(), epoch * iters_per_epoch + i)
 
         # compute gradient and do SGD step
-        optimizer.zero_grad()
+        if (i+1) % accum_iter == 0:
+            optimizer.zero_grad()
+
         scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+
+        if (i+1) % accum_iter == 0:
+            scaler.step(optimizer)
+            scaler.update()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -407,7 +431,11 @@ class ProgressMeter(object):
         self.prefix = prefix
 
     def display(self, batch):
-        entries = [self.prefix + self.batch_fmtstr.format(batch)]
+        ts = str(datetime.datetime.now()).split(".")[0].replace(" ", "_")
+
+        prefix = self.prefix + " " + ts + " "
+
+        entries = [prefix + self.batch_fmtstr.format(batch)]
         entries += [str(meter) for meter in self.meters]
         print('\t'.join(entries))
 
