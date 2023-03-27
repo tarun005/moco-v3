@@ -352,14 +352,20 @@ def main_worker(gpu, ngpus_per_node, args):
         # if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 # and args.rank == 0): # only the first GPU saves checkpoint
         if args.rank == 0:
-            if (epoch % 20) == 0:
-                save_checkpoint({
+            save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
                 'state_dict': model.module.state_dict(),
                 'optimizer' : optimizer.state_dict(),
                 'scaler': scaler.state_dict(),
-            }, is_best=False, filename=os.path.join(args.output_dir, 'checkpoint_%03d.pkl' % epoch))
+            }, is_best=False, filename=os.path.join(args.output_dir, 'checkpoint.pkl'))
+
+            if (epoch % 20) == 0:
+                shutil.copyfile(
+                    os.path.join(args.output_dir, "checkpoint.pkl"),
+                    os.path.join(args.output_dir, 'checkpoint_%03d.pkl' % epoch),
+                )
+                
 
     # if args.rank == 0:
     #     summary_writer.close()
