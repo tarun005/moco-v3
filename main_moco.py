@@ -135,6 +135,7 @@ parser.add_argument('--warmup-epochs', default=10, type=int, metavar='N',
 parser.add_argument('--crop-min', default=0.08, type=float,
                     help='minimum scale for random cropping (default: 0.08)')
 parser.add_argument('--output_dir', type=str, default="now")
+parser.add_argument('--subset_size', type=int, default=1000000)
 
 
 def main():
@@ -323,6 +324,9 @@ def main_worker(gpu, ngpus_per_node, args):
         moco.loader.TwoCropsTransform(transforms.Compose(augmentation1), 
                                       transforms.Compose(augmentation2)))
 
+    if args.subset_size is not None:
+        train_dataset = torch.utils.data.Subset(train_dataset, misc.select_indices(train_dataset, args.subset_size))
+
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset,    
                                                             num_replicas=num_tasks, rank=global_rank, shuffle=True)
@@ -345,16 +349,17 @@ def main_worker(gpu, ngpus_per_node, args):
         # train for one epoch
         train(train_loader, model, optimizer, scaler, summary_writer, epoch, args)
 
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank == 0): # only the first GPU saves checkpoint
+        # if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                # and args.rank == 0): # only the first GPU saves checkpoint
+        if args.rank == 0:
             if (epoch % 20) == 0:
                 save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
-                'state_dict': model.state_dict(),
+                'state_dict': model.module.state_dict(),
                 'optimizer' : optimizer.state_dict(),
                 'scaler': scaler.state_dict(),
-            }, is_best=False, filename=os.path.join(args.output_dir, 'checkpoint_%04d.pth.tar' % epoch))
+            }, is_best=False, filename=os.path.join(args.output_dir, 'checkpoint_%03d.pkl' % epoch))
 
     # if args.rank == 0:
     #     summary_writer.close()
@@ -461,9 +466,7 @@ class ProgressMeter(object):
     def display(self, batch):
         ts = str(datetime.datetime.now()).split(".")[0].replace(" ", "_")
 
-        prefix = self.prefix + " " + ts + " "
-
-        entries = [prefix + self.batch_fmtstr.format(batch)]
+        entries = [self.prefix + self.batch_fmtstr.format(batch)]
         entries += [str(meter) for meter in self.meters]
         print('\t'.join(entries))
 
