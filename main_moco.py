@@ -267,6 +267,14 @@ def main_worker(gpu, ngpus_per_node, args):
     # summary_writer = SummaryWriter() if args.rank == 0 else None
     summary_writer = None
 
+    if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                and args.rank == 0): # only the first GPU saves checkpoint
+        if not os.path.exists(args.output_dir):
+            os.makedirs(args.output_dir, exist_ok=True)
+
+        if os.path.exists(os.path.join(args.output_dir, "checkpoint.pkl")) and args.resume == "":
+            args.resume = os.path.join(args.output_dir, "checkpoint.pkl")
+
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
@@ -336,11 +344,6 @@ def main_worker(gpu, ngpus_per_node, args):
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
-
-    if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank == 0): # only the first GPU saves checkpoint
-        if not os.path.exists(args.output_dir):
-            os.makedirs(args.output_dir, exist_ok=True)
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
